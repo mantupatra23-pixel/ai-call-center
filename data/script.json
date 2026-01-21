@@ -1,0 +1,22 @@
+{
+  "intents": {
+    "hindi": {
+      "price": "Hamari service 499 rupaye se shuru hoti hai. Kya aap lena chahenge?",
+      "buy": "Bahut badhiya! Main abhi aapko payment link bhej raha hoon.",
+      "bye": "Dhanyavaad! Phir baat hogi.",
+      "fallback": "Kripya apna sawaal dobara boliye."
+    },
+    "english": {
+      "price": "Our service starts from 499 rupees. Would you like to proceed?",
+      "buy": "Great! I am sending you the payment link now.",
+      "bye": "Thank you. Talk to you again.",
+      "fallback": "Please repeat your question."
+    },
+    "arabic": {
+      "price": "تبدأ خدمتنا من ٤٩٩ روبية. هل ترغب في المتابعة؟",
+      "buy": "رائع! سأرسل لك رابط الدفع الآن.",
+      "bye": "شكرًا لك. سنتحدث مرة أخرى.",
+      "fallback": "من فضلك أعد سؤالك."
+    }
+  }
+}

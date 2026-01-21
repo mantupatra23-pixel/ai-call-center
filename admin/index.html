@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AI Call Center Dashboard</title>
+  <style>
+    body { font-family: Arial; background:#111; color:#0f0; }
+    table { width:100%; border-collapse: collapse; }
+    td,th { border:1px solid #0f0; padding:8px; }
+  </style>
+</head>
+<body>
+
+<h2>📞 AI Call Center Dashboard</h2>
+
+<div id="stats"></div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Phone</th>
+      <th>Text</th>
+      <th>Emotion</th>
+    </tr>
+  </thead>
+  <tbody id="calls"></tbody>
+</table>
+
+<script>
+fetch("/admin/stats")
+.then(r=>r.json())
+.then(d=>{
+  document.getElementById("stats").innerHTML =
+   `Total Calls: ${d.total_calls}<br>
+    Emotion Stats: ${JSON.stringify(d.emotion_stats)}`;
+});
+
+fetch("/admin/calls")
+.then(r=>r.json())
+.then(data=>{
+  document.getElementById("calls").innerHTML =
+    data.map(c=>`
+      <tr>
+        <td>${c.phone}</td>
+        <td>${c.text}</td>
+        <td>${c.emotion}</td>
+      </tr>
+    `).join("");
+});
+</script>
+
+</body>
+</html>

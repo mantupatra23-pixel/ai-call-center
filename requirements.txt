@@ -3,3 +3,5 @@ uvicorn
 twilio
 pydantic
 gtts
+requests
+google-cloud-texttospeech
