@@ -1,7 +1,23 @@
 fastapi
 uvicorn
+gunicorn
+
+# Twilio & Voice
 twilio
-pydantic
-gtts
+python-multipart
 requests
+
+# Redis & Queue
+redis
+rq
+
+# Environment & Validation
+pydantic
+python-dotenv
+
+# TTS (Google + ElevenLabs via requests)
+gtts
 google-cloud-texttospeech
+
+# Optional but recommended
+httpx
