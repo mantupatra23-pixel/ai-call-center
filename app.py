@@ -2,9 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# =========================
 # Routers
-# =========================
 from api.voice_api import router as voice_router
 from api.script_api import router as script_router
 from api.admin_api import router as admin_router
@@ -19,10 +17,8 @@ app = FastAPI(
     version="1.0.0"
 )
 
-app.include_router(dashboard_router)
-
 # =========================
-# 🔥 CORS (Allow All)
+# CORS (Allow All)
 # =========================
 app.add_middleware(
     CORSMiddleware,
@@ -33,14 +29,14 @@ app.add_middleware(
 )
 
 # =========================
-# 🔥 STATIC FILES (TTS Audio)
+# Static Files (TTS Audio)
 # =========================
 # Folder: static/
-# Use for Google TTS / ElevenLabs generated audio
+# Example file: static/voice/output.mp3
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # =========================
-# 🔥 ROUTERS
+# Routers
 # =========================
 app.include_router(
     voice_router,
@@ -60,8 +56,14 @@ app.include_router(
     tags=["Admin API"]
 )
 
+app.include_router(
+    dashboard_router,
+    prefix="/dashboard",
+    tags=["Dashboard API"]
+)
+
 # =========================
-# 🔥 HEALTH CHECK
+# Health Check
 # =========================
 @app.get("/", tags=["Health"])
 def home():
@@ -71,7 +73,7 @@ def home():
     }
 
 # =========================
-# 🔥 STARTUP LOG
+# Startup Log
 # =========================
 @app.on_event("startup")
 async def startup_event():
