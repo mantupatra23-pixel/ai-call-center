@@ -1,0 +1,177 @@
+# api/voice_api.py
+
+import os
+import json
+import requests
+import redis
+
+from fastapi import APIRouter, Query, Request, HTTPException, Depends
+from fastapi.responses import PlainTextResponse
+from services.billing_service import start_call_billing
+from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
+from rq import Queue
+
+from db.redis import redis_db
+from core.auth_guard import get_current_user
+
+# =========================
+# ROUTER
+# =========================
+router = APIRouter(prefix="/voice", tags=["Voice"])
+
+# =========================
+# ENV
+# =========================
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_TOKEN")
+BASE_URL = os.getenv("PUBLIC_BASE_URL")
+REDIS_URL = os.getenv("REDIS_URL")
+
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
+
+if not BASE_URL:
+    raise RuntimeError("PUBLIC_BASE_URL missing")
+
+if not REDIS_URL:
+    raise RuntimeError("REDIS_URL missing")
+
+# =========================
+# CLIENTS
+# =========================
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+redis_conn = redis.from_url(
+    REDIS_URL,
+    decode_responses=True
+)
+
+call_queue = Queue("calls", connection=redis_conn)
+
+# =========================
+# START CALL (WITH WALLET CHECK)
+# =========================
+@router.post("/make-call")
+def make_call(
+    to_phone: str = Query(...),
+    from_phone: str = Query(...),
+    user=Depends(get_current_user)
+):
+    # ✅ Phone validation
+    if not to_phone.startswith("+") or not from_phone.startswith("+"):
+        raise HTTPException(
+            status_code=400,
+            detail="Phone numbers must be in E.164 format"
+        )
+
+    # ✅ Load admin config
+    config_raw = redis_db.get("admin:config")
+    if not config_raw:
+        raise HTTPException(500, "Call rate not set by admin")
+
+    config = json.loads(config_raw)
+    rate = float(config.get("call_rate_per_min", 0))
+
+    if rate <= 0:
+        raise HTTPException(500, "Invalid call rate")
+
+    # ✅ Wallet check
+    if user["wallet"] < rate:
+        raise HTTPException(
+            status_code=402,
+            detail="Insufficient wallet balance"
+        )
+
+    # ✅ Queue call
+    job = call_queue.enqueue(
+        place_call,
+        to_phone,
+        from_phone,
+        user["id"]
+    )
+
+    return {
+        "status": "queued",
+        "job_id": job.id,
+        "rate_per_min": rate,
+        "wallet_balance": user["wallet"]
+    }
+
+# =========================
+# TWILIO FIRST VOICE
+# =========================
+@router.post("/twilio-voice", response_class=PlainTextResponse)
+def twilio_voice():
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="hi-IN">
+        Namaskar! Hello!
+        Main AI Call Center se bol raha hoon.
+    </Say>
+    <Gather input="speech" action="{BASE_URL}/voice/process-speech"/>
+</Response>
+"""
+
+# =========================
+# PROCESS SPEECH
+# =========================
+@router.post("/process-speech", response_class=PlainTextResponse)
+async def process_speech(request: Request):
+    form = await request.form()
+
+    call_sid = form.get("CallSid")
+    user_text = (form.get("SpeechResult") or "").strip().lower()
+
+    # 🔴 HARD STOP: balance finished → auto hangup
+    if redis_db.get(f"call:hangup:{call_sid}"):
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Your balance is finished. Call ending.</Say>
+  <Hangup/>
+</Response>"""
+
+    # ❌ No speech detected
+    if not user_text:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Please repeat your question.</Say>
+  <Gather input="speech" action="{BASE_URL}/voice/process-speech"/>
+</Response>"""
+
+    # 🧠 DEFAULT AI REPLY (👇 yahan tum reply change kar sakte ho)
+    reply = "Thank you for calling. How can I help you?"
+
+    # 👋 USER END CALL
+    if any(w in user_text for w in ["bye", "goodbye", "stop", "end call"]):
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>{reply}</Say>
+  <Hangup/>
+</Response>"""
+
+    # 🔁 NORMAL CONTINUE
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>{reply}</Say>
+  <Gather input="speech" action="{BASE_URL}/voice/process-speech"/>
+</Response>"""
+
+# =========================
+# RQ WORKER FUNCTION
+# =========================
+def place_call(to_phone: str, from_phone: str, customer_id: str):
+    try:
+        call = twilio_client.calls.create(
+            to=to_phone,
+            from_=from_phone,
+            url=f"{BASE_URL}/voice/twilio-voice",
+            record=True
+        )
+
+        print(
+            f"CALL STARTED | SID={call.sid} | CUSTOMER={customer_id}"
+        )
+
+    except TwilioRestException as e:
+        print("TWILIO ERROR:", e)

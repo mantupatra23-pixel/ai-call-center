@@ -2,7 +2,10 @@ from fastapi import APIRouter
 from models.customer import CustomerCreate
 from db.redis import redis_db
 import uuid, json
+# Added the new import here
+from services.active_call_service import list_customer_calls
 
+# Assumed tags is closed as "Customer" based on the screenshot cut-off
 router = APIRouter(prefix="/customer", tags=["Customer"])
 
 @router.post("/register")
@@ -31,7 +34,6 @@ def register_customer(data: CustomerCreate):
         "status": "pending"
     }
 
-
 @router.get("/status/{customer_id}")
 def check_status(customer_id: str):
     data = redis_db.get(f"customer:{customer_id}")
@@ -43,3 +45,8 @@ def check_status(customer_id: str):
         "customer_id": customer_id,
         "status": customer["status"]
     }
+
+# Added the new endpoint here
+@router.get("/my-live-calls")
+def my_live_calls(customer_id: str):
+    return list_customer_calls(customer_id)

@@ -1,30 +1,34 @@
+# api/twilio_webhook_api.py
+
 import time
 from fastapi import APIRouter, Request
+
+from services.billing_service import (
+    start_call_billing,
+    end_call_billing,
+)
 
 from services.call_log_service import (
     save_call_log,
     update_call_log,
 )
 
-from services.wallet_service import (
-    deduct_balance,
-    get_balance,
-)
-
-from services.safety_service import is_duration_allowed
 from services.idempotency_service import (
     is_processed,
     mark_processed,
 )
 
-from services.revenue_guard_service import has_grace_balance
 from services.notification_service import notify_low_balance
+from services.wallet_service import get_balance
 
-
-router = APIRouter(
-    prefix="/twilio",
-    tags=["Twilio"]
+from services.call_registry_service import (
+    get_call,
+    delete_call,
 )
+
+from services.active_call_service import remove_active_call
+
+router = APIRouter(prefix="/twilio", tags=["Twilio"])
 
 # =====================================================
 # TWILIO CALL STATUS WEBHOOK
@@ -32,8 +36,9 @@ router = APIRouter(
 @router.post("/call-status")
 async def call_status(request: Request):
     """
-    Twilio will hit this webhook automatically
-    ringing -> in-progress -> completed / failed
+    Twilio events:
+    initiated -> ringing -> in-progress -> completed
+    failed / busy / no-answer
     """
 
     form = await request.form()
@@ -45,21 +50,23 @@ async def call_status(request: Request):
     from_number = form.get("From")
     to_number = form.get("To")
 
-    # Custom field passed while creating call
-    customer_id = form.get("CustomerId") or "unknown"
+    # Get call registry (customer_id saved earlier)
+    call = get_call(call_sid)
+    customer_id = call["customer_id"] if call else None
 
-    # -------------------------------------------------
-    # IDEMPOTENCY (ANTI DUPLICATE)
-    # -------------------------------------------------
+    # =====================================================
+    # IDEMPOTENCY (ANTI DOUBLE BILLING)
+    # =====================================================
     unique_key = f"{call_sid}:{call_status}"
-
     if is_processed(unique_key):
         return {"ok": True, "duplicate": True}
 
-    # -------------------------------------------------
-    # RINGING / IN-PROGRESS
-    # -------------------------------------------------
+    # =====================================================
+    # RINGING / IN-PROGRESS → START BILLING SESSION
+    # =====================================================
     if call_status in ("ringing", "in-progress"):
+        start_call_billing(call_sid, customer_id)
+
         save_call_log({
             "call_sid": call_sid,
             "customer_id": customer_id,
@@ -68,45 +75,54 @@ async def call_status(request: Request):
             "status": call_status,
             "duration_sec": 0,
             "cost": 0.0,
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
 
-    # -------------------------------------------------
-    # COMPLETED
-    # -------------------------------------------------
+    # =====================================================
+    # COMPLETED → FINAL BILLING
+    # =====================================================
     elif call_status == "completed":
-
-        cost = 0.0
-
-        # 🔐 SAFETY + GRACE BALANCE CHECK
-        if is_duration_allowed(duration) and has_grace_balance(customer_id):
-            minutes = max(1, duration // 60)
-            cost = deduct_balance(customer_id, minutes)
+        bill = end_call_billing(call_sid)
 
         update_call_log(call_sid, {
             "status": "completed",
             "duration_sec": duration,
-            "cost": cost,
-            "completed_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            "cost": bill["cost"] if bill else 0,
+            "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
 
-        # 🔔 LOW BALANCE ALERT (POST CALL)
+        # 🔔 Low balance alert
         balance = get_balance(customer_id)
         if balance < 50:
             notify_low_balance(customer_id, balance)
 
-    # -------------------------------------------------
+        # 🧹 Cleanup registry
+        delete_call(call_sid)
+
+        # 🔴 REMOVE ACTIVE CALL (LIVE DASHBOARD)
+        remove_active_call(call_sid)
+
+    # =====================================================
     # FAILED / BUSY / NO-ANSWER
-    # -------------------------------------------------
+    # =====================================================
     elif call_status in ("failed", "busy", "no-answer"):
         update_call_log(call_sid, {
             "status": call_status,
-            "completed_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
 
-    # -------------------------------------------------
+        delete_call(call_sid)
+
+        # 🔴 REMOVE ACTIVE CALL
+        remove_active_call(call_sid)
+
+    # =====================================================
     # MARK PROCESSED (VERY IMPORTANT)
-    # -------------------------------------------------
+    # =====================================================
     mark_processed(unique_key)
 
-    return {"ok": True}
+    return {
+        "ok": True,
+        "call_sid": call_sid,
+        "status": call_status,
+    }

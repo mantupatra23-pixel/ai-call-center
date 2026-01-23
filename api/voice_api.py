@@ -1,232 +1,258 @@
-import os
-import json
-import redis
-import requests
+# api/voice_api.py
 
-from rq import Queue
-from fastapi import APIRouter, Query, Request, HTTPException
+import os, json, redis, requests
+from fastapi import APIRouter, Query, Request, HTTPException, Depends
 from fastapi.responses import PlainTextResponse
+from rq import Queue
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
+
+from db.redis import redis_db
+from core.auth_guard import get_current_user
+
+from services.ai_agent_service import ai_reply
+from services.ai_memory_service import (
+    add_call_memory,
+    get_call_memory,
+    increment_call_count,
+    should_summarize,
+    save_summary
+)
+
+from services.billing_service import start_call_billing, stop_call_billing
+from services.subscription_service import consume_minutes
+from services.crm_service import create_lead
+from services.whatsapp_service import send_whatsapp
+from services.sales_service import detect_sales_intent, upsell_reply
+from services.booking_service import save_booking
 
 # =====================================================
 # ROUTER
 # =====================================================
-router = APIRouter()
+router = APIRouter(prefix="/voice", tags=["Voice"])
 
 # =====================================================
 # ENV
 # =====================================================
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_TOKEN")
-TWILIO_PHONE = os.getenv("TWILIO_NUMBER")
+TWILIO_SID = os.getenv("TWILIO_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
 BASE_URL = os.getenv("PUBLIC_BASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
-
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
 
-if not BASE_URL:
-    raise RuntimeError("PUBLIC_BASE_URL missing")
+if not all([TWILIO_SID, TWILIO_TOKEN, BASE_URL, REDIS_URL,
+            ELEVEN_API_KEY, ELEVEN_VOICE_ID]):
+    raise RuntimeError("Missing ENV variables")
 
 # =====================================================
 # CLIENTS
 # =====================================================
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-redis_conn = redis.from_url(
-    REDIS_URL,
-    decode_responses=True
-)
-
+twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
+redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
 call_queue = Queue("calls", connection=redis_conn)
 
 # =====================================================
-# HELPERS
+# ELEVENLABS TTS
 # =====================================================
-def detect_language(text: str):
-    text = text.lower()
+def eleven_tts(text: str) -> str:
+    os.makedirs("static/voice", exist_ok=True)
+    fname = f"{abs(hash(text))}.mp3"
+    path = f"static/voice/{fname}"
 
-    if any("\u0600" <= c <= "\u06FF" for c in text):
-        return "ar-SA", "arabic"
-
-    if any(w in text for w in ["kya", "hai", "nahi", "rupaye", "namaste"]):
-        return "hi-IN", "hindi"
-
-    return "en-US", "english"
-
-
-def detect_emotion(text: str):
-    text = text.lower()
-
-    if any(w in text for w in ["problem", "complaint", "issue", "angry"]):
-        return "angry"
-    if any(w in text for w in ["thanks", "thank you", "great"]):
-        return "happy"
-    if any(w in text for w in ["sad", "bad", "disappointed"]):
-        return "sad"
-
-    return "neutral"
-
-
-def match_intent(text, intents, fallback):
-    text = text.lower()
-    for key, reply in intents.items():
-        if key in text:
-            return reply
-    return fallback
-
-
-def save_call_log(phone, text, emotion):
-    os.makedirs("data", exist_ok=True)
-    path = "data/call_logs.json"
-
-    logs = []
-    if os.path.exists(path):
-        with open(path) as f:
-            logs = json.load(f)
-
-    logs.append({
-        "phone": phone,
-        "text": text,
-        "emotion": emotion
-    })
-
-    with open(path, "w") as f:
-        json.dump(logs, f, indent=2, ensure_ascii=False)
-
-
-def elevenlabs_tts(text, emotion="neutral"):
-    if not ELEVEN_API_KEY or not ELEVEN_VOICE_ID:
-        return None
-
-    try:
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}"
-        headers = {
+    r = requests.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}",
+        headers={
             "xi-api-key": ELEVEN_API_KEY,
             "Content-Type": "application/json"
-        }
-
-        payload = {
+        },
+        json={
             "text": text,
+            "model_id": "eleven_multilingual_v2",
             "voice_settings": {
-                "stability": 0.3 if emotion == "angry" else 0.6,
-                "similarity_boost": 0.85
+                "stability": 0.45,
+                "similarity_boost": 0.75
             }
-        }
+        },
+        timeout=15
+    )
 
-        r = requests.post(url, json=payload, headers=headers, timeout=15)
-        if r.status_code != 200:
-            return None
+    if r.status_code != 200:
+        return eleven_tts("Kripya thoda intezaar karein.")
 
-        os.makedirs("static/voice", exist_ok=True)
-        audio_path = "static/voice/output.mp3"
+    with open(path, "wb") as f:
+        f.write(r.content)
 
-        with open(audio_path, "wb") as f:
-            f.write(r.content)
-
-        return "/static/voice/output.mp3"
-
-    except Exception as e:
-        print("ELEVENLABS ERROR:", e)
-        return None
-
+    return f"{BASE_URL}/{path}"
 
 # =====================================================
-# WORKER FUNCTION (RQ)
+# LANGUAGE DETECT
 # =====================================================
-def place_call(phone: str):
-    try:
-        call = twilio_client.calls.create(
-            to=phone,
-            from_=TWILIO_PHONE,
-            url=f"{BASE_URL}/voice/twilio-voice",
-            record=True
-        )
-        print("CALL STARTED:", call.sid)
-    except TwilioRestException as e:
-        print("TWILIO ERROR:", e)
-
+def detect_lang(text: str):
+    for h in ["kya", "hai", "nahi", "kyu", "ka", "ke"]:
+        if h in text.lower():
+            return "hi"
+    return "en"
 
 # =====================================================
-# API ENDPOINTS
+# MAKE CALL API
 # =====================================================
 @router.post("/make-call")
-def make_call(phone: str = Query(...)):
-    if not phone.startswith("+"):
-        raise HTTPException(400, "Phone must be in +91XXXXXXXXXX format")
+def make_call(
+    to_phone: str = Query(...),
+    from_phone: str = Query(...),
+    user=Depends(get_current_user)
+):
+    if not to_phone.startswith("+") or not from_phone.startswith("+"):
+        raise HTTPException(400, "Invalid phone format")
 
-    job = call_queue.enqueue(place_call, phone)
+    cfg = redis_db.get("admin:config")
+    rate = float(json.loads(cfg).get("call_rate_per_min", 0))
 
-    return {
-        "queued": True,
-        "job_id": job.id,
-        "phone": phone
-    }
+    if user["wallet"] < rate:
+        raise HTTPException(402, "Low wallet")
 
+    job = call_queue.enqueue(place_call, to_phone, from_phone, user["id"])
+    return {"queued": True, "job_id": job.id}
 
+# =====================================================
+# TWILIO FIRST RESPONSE
+# =====================================================
 @router.post("/twilio-voice", response_class=PlainTextResponse)
 def twilio_voice():
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    audio = eleven_tts("Namaskar! Main AI Call Center se bol raha hoon.")
+    return f"""
 <Response>
-    <Say language="hi-IN">
-        Namaskar! Hello! Marhaban!
-        Main AI Call Center se bol raha hoon.
-    </Say>
-    <Gather input="speech" action="{BASE_URL}/voice/process-speech" />
+  <Play>{audio}</Play>
+  <Gather input="speech" timeout="5" action="{BASE_URL}/voice/process-speech"/>
 </Response>
 """
 
-
+# =====================================================
+# PROCESS SPEECH (AI + MEMORY + SALES)
+# =====================================================
 @router.post("/process-speech", response_class=PlainTextResponse)
 async def process_speech(request: Request):
     form = await request.form()
-    user_text = (form.get("SpeechResult") or "").strip()
+    call_sid = form.get("CallSid")
+    text = (form.get("SpeechResult") or "").strip()
+    to_phone = form.get("To")
 
-    if not user_text:
-        return f"""<?xml version="1.0" encoding="UTF-8"?>
+    customer_id = redis_db.get(f"call:customer:{call_sid}")
+
+    if not text:
+        audio = eleven_tts("Kripya bolein.")
+        return f"<Response><Play>{audio}</Play><Gather input='speech' action='{BASE_URL}/voice/process-speech'/></Response>"
+
+    if any(w in text.lower() for w in ["bye", "band", "goodbye"]):
+        audio = eleven_tts("Dhanyavaad. Call samapt.")
+        return f"<Response><Play>{audio}</Play><Hangup/></Response>"
+
+    # 🧠 SHORT MEMORY
+    add_call_memory(call_sid, "User", text)
+    history = get_call_memory(call_sid)
+
+    with open("data/company_profile.json") as f:
+        company_profile = json.load(f)
+
+    lang = detect_lang(text)
+
+    # 🔥 SALES INTENT
+    intent = detect_sales_intent(text)
+    sales_reply = upsell_reply(intent)
+
+    if sales_reply:
+        reply = sales_reply
+    else:
+        reply = ai_reply(
+            user_text=history,
+            company_profile=company_profile,
+            lang=lang,
+            customer_id=customer_id
+        )
+
+    add_call_memory(call_sid, "AI", reply)
+
+    # 🔥 BOOKING
+    if intent in ["demo", "buy", "booking"]:
+        save_booking(call_sid=call_sid, phone=to_phone, intent=intent)
+
+    audio = eleven_tts(reply)
+
+    return f"""
 <Response>
-    <Say>Please repeat your question.</Say>
-    <Gather input="speech" action="{BASE_URL}/voice/process-speech" />
+  <Play>{audio}</Play>
+  <Gather input="speech" action="{BASE_URL}/voice/process-speech"/>
 </Response>
 """
 
-    lang_code, lang_key = detect_language(user_text)
-    emotion = detect_emotion(user_text)
+# =====================================================
+# CALL STATUS (BILLING + MEMORY SUMMARY + CRM)
+# =====================================================
+@router.post("/call-status")
+async def call_status(request: Request):
+    form = await request.form()
+    sid = form.get("CallSid")
+    status = form.get("CallStatus")
+    to_phone = form.get("To")
 
-    # Load script safely
-    script = {"intents": {}}
-    if os.path.exists("data/script.json"):
-        with open("data/script.json", encoding="utf-8") as f:
-            script = json.load(f)
+    if status in ["completed", "failed", "busy", "no-answer"]:
+        cid = redis_db.get(f"call:customer:{sid}")
+        duration = int(form.get("CallDuration", 0))
 
-    intents = script.get("intents", {}).get(lang_key, {})
-    fallback = intents.get("fallback", "Sorry, I did not understand.")
-    reply = match_intent(user_text, intents, fallback)
+        stop_call_billing(sid, cid)
+        consume_minutes(cid, max(1, duration // 60))
 
-    save_call_log("unknown", user_text, emotion)
+        # 🧠 LONG MEMORY SUMMARY
+        if cid:
+            count = increment_call_count(cid)
+            if should_summarize(cid):
+                save_summary(
+                    cid,
+                    "Customer showed interest, spoke politely, prefers Hindi."
+                )
 
-    # END CALL
-    if any(w in user_text.lower() for w in ["bye", "goodbye", "thanks"]):
-        return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="{lang_code}">{reply}</Say>
-    <Hangup/>
-</Response>
-"""
+        create_lead(
+            call_sid=sid,
+            phone=to_phone,
+            intent="sales",
+            emotion="interested"
+        )
 
-    audio = elevenlabs_tts(reply, emotion)
-    if audio:
-        return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Play>{BASE_URL}{audio}</Play>
-    <Gather input="speech" action="{BASE_URL}/voice/process-speech" />
-</Response>
-"""
+        send_whatsapp(
+            to_phone=to_phone,
+            text="Thanks for calling 🙏 Our team will contact you shortly."
+        )
 
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="{lang_code}">{reply}</Say>
-    <Gather input="speech" action="{BASE_URL}/voice/process-speech" />
-</Response>
-"""
+    return {"ok": True}
+
+# =====================================================
+# RECORDING WEBHOOK
+# =====================================================
+@router.post("/recording")
+async def recording_webhook(request: Request):
+    form = await request.form()
+    redis_db.hset("call:recordings", form.get("CallSid"), form.get("RecordingUrl"))
+    return {"saved": True}
+
+# =====================================================
+# RQ WORKER
+# =====================================================
+def place_call(to_phone: str, from_phone: str, customer_id: str):
+    try:
+        call = twilio_client.calls.create(
+            to=to_phone,
+            from_=from_phone,
+            url=f"{BASE_URL}/voice/twilio-voice",
+            status_callback=f"{BASE_URL}/voice/call-status",
+            status_callback_event=["completed"],
+            record=True,
+            recording_channels="dual",
+            recording_status_callback=f"{BASE_URL}/voice/recording"
+        )
+
+        redis_db.set(f"call:customer:{call.sid}", customer_id)
+        start_call_billing(call.sid, customer_id)
+
+    except TwilioRestException as e:
+        print("Twilio error:", e)
