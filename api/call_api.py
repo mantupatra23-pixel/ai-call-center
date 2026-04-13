@@ -20,9 +20,8 @@ from services.dnc_service import is_dnc
 from services.working_hours_service import is_within_hours
 from services.call_registry_service import register_call_start
 
-from services.billing_service import (
-    start_call_billing,
-    end_call_billing,
+from services.billing_service import start_call_billing, stop_call_billing
+
 )
 
 from services.active_call_service import (
