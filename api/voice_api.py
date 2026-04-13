@@ -17,7 +17,7 @@ from core.auth_guard import get_current_user
 # AI & Services Logic
 from services.ai_agent_service import ai_reply
 from services.ai_memory_service import (
-    add_call_memory, get_call_memory, increment_call_count, should_summarize, save_summary
+    add_call_memory, get_call_memory
 )
 from services.billing_service import start_call_billing, stop_call_billing
 from services.crm_service import create_lead
@@ -42,19 +42,11 @@ redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
 call_queue = Queue("calls", connection=redis_conn)
 
 # =================================================================
-# AZURE NEURAL TTS (PRO VERSION)
+# AZURE VOICE
 # =================================================================
 def generate_voice(text: str) -> str:
-    """Generates high-fidelity human-like voice and manages cleanup."""
     voice_dir = "static/voice"
     os.makedirs(voice_dir, exist_ok=True)
-    
-    # Auto-cleanup files older than 30 mins to avoid Render storage limits
-    for f in os.listdir(voice_dir):
-        fpath = os.path.join(voice_dir, f)
-        if os.path.getmtime(fpath) < (datetime.now() - timedelta(minutes=30)).timestamp():
-            try: os.remove(fpath)
-            except: pass
 
     fname = f"v_{abs(hash(text))}.mp3"
     path = f"{voice_dir}/{fname}"
@@ -63,160 +55,98 @@ def generate_voice(text: str) -> str:
     if not os.path.exists(full_path):
         speech_config = speechsdk.SpeechConfig(subscription=AZURE_KEY, region=AZURE_REGION)
         audio_config = speechsdk.audio.AudioOutputConfig(filename=full_path)
-        
-        # Best Indian Professional Voice
-        speech_config.speech_synthesis_voice_name = "hi-IN-MadhurNeural"
-        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
 
-        # SSML: Cheerful style for sales conversion
+        speech_config.speech_synthesis_voice_name = "hi-IN-MadhurNeural"
+
+        synthesizer = speechsdk.SpeechSynthesizer(
+            speech_config=speech_config,
+            audio_config=audio_config
+        )
+
         ssml = f"""
-        <speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='http://www.w3.org/2001/mstts' xml:lang='hi-IN'>
+        <speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis'>
             <voice name='hi-IN-MadhurNeural'>
-                <mstts:express-as style='cheerful' styledegree='1.1'>
-                    <prosody rate='-2%'>
-                        {text}
-                    </prosody>
-                </mstts:express-as>
+                {text}
             </voice>
         </speak>
         """
+
         synthesizer.speak_ssml_async(ssml).get()
 
     return f"{BASE_URL}/{path}"
 
 # =================================================================
-# TWILIO RESPONSE GENERATOR
+# TWILIO RESPONSE
 # =================================================================
-def get_txml(audio_url: str, gather: bool = True):
-    """Twilio Markup with Barge-in (Interruption) support."""
-    xml = f'<?xml version="1.0" encoding="UTF-8"?><Response>'
-    xml += f'<Play>{audio_url}</Play>'
-    
-    if gather:
-        xml += f'''<Gather 
-            input="speech" 
-            timeout="4" 
-            action="{BASE_URL}/voice/process-speech" 
-            method="POST" 
-            speechTimeout="auto" 
-            hints="haan, price, interested, callback"
-            interruptible="true"
-        />'''
-        # Fallback if user stays silent
-        xml += f'<Redirect>{BASE_URL}/voice/process-speech</Redirect>'
-    
-    xml += '</Response>'
-    return xml
+def get_txml(audio_url: str):
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+<Play>{audio_url}</Play>
+<Gather input="speech" action="{BASE_URL}/voice/process-speech" method="POST"/>
+</Response>
+"""
 
 # =================================================================
-# API ENDPOINTS
+# API
 # =================================================================
 
 @router.post("/make-call")
-def make_call(to_phone: str = Query(...), from_phone: str = Query(...), user=Depends(get_current_user)):
-    """Triggers call through Redis Worker."""
+def make_call(
+    to_phone: str = Query(...),
+    from_phone: str = Query(...),
+    user=Depends(get_current_user)
+):
     if not to_phone.startswith("+"):
-        raise HTTPException(400, "Phone number must be in E.164 format (e.g. +91...)")
-    
-    # Wallet Balance Check
-    if user.get("wallet", 0) <= 0:
-        raise HTTPException(402, "Low Wallet Balance. Please Recharge.")
-    
+        raise HTTPException(400, "Use +91 format")
+
     job = call_queue.enqueue(place_call, to_phone, from_phone, user["id"])
-    return {"status": "success", "message": "Call Queued", "job_id": job.id}
+    return {"status": "queued", "job_id": job.id}
+
 
 @router.post("/twilio-voice", response_class=PlainTextResponse)
-async def twilio_voice(request: Request):
-    """Entry point for Twilio Calls with AMD."""
-    form = await request.form()
-    # Check if a machine (voicemail) answered
-    if "machine" in form.get("AnsweredBy", "human").lower():
-        return "<Response><Hangup/></Response>"
+async def twilio_voice():
+    msg = "Namaste! Main AI assistant bol raha hoon."
+    return get_txml(generate_voice(msg))
 
-    welcome_msg = "Namaskar! Main Visora AI se baat kar raha hoon. Kya main aapka thoda samay le sakta hoon?"
-    return get_txml(generate_voice(welcome_msg))
 
 @router.post("/process-speech", response_class=PlainTextResponse)
 async def process_speech(request: Request):
-    """Main Conversation Loop & Sales Logic."""
     form = await request.form()
-    call_sid = form.get("CallSid")
     text = (form.get("SpeechResult") or "").strip()
-    to_phone = form.get("To")
-    customer_id = redis_db.get(f"call:customer:{call_sid}")
 
-    # Handle silence
     if not text:
-        return get_txml(generate_voice("Maaf kijiye, mujhe sunayi nahi diya. Kya aap phir se bol sakte hain?"))
+        return get_txml(generate_voice("Please repeat"))
 
-    # Human Transfer (Elite Feature)
-    if any(w in text.lower() for w in ["manager", "senior", "human", "insaan"]):
-        transfer_msg = "Zaroor, main aapki call hamare senior manager ko transfer kar raha hoon. Kripya bane rahein."
-        return f'<Response><Play>{generate_voice(transfer_msg)}</Play><Dial>+919876543210</Dial></Response>'
-
-    # Termination Logic
-    if any(w in text.lower() for w in ["bye", "band", "no thanks", "shukriya"]):
-        return f'<Response><Play>{generate_voice("Dhanyavaad, aapka din shubh ho.")}</Play><Hangup/></Response>'
-
-    # AI Brain Execution
-    add_call_memory(call_sid, "User", text)
-    history = get_call_memory(call_sid)
-    
-    intent = detect_sales_intent(text)
-    reply = upsell_reply(intent)
-    
-    if not reply:
-        try:
-            with open("data/company_profile.json") as f:
-                profile = json.load(f)
-        except:
-            profile = {"name": "Visora AI"}
-        reply = ai_reply(user_text=text, history=history, company_profile=profile, lang="hi")
-
-    add_call_memory(call_sid, "AI", reply)
-
-    # Automated Lead Gen
-    if intent in ["booking", "interested", "price"]:
-        save_booking(call_sid=call_sid, phone=to_phone)
-        create_lead(call_sid=call_sid, phone=to_phone, intent=intent)
+    reply = ai_reply(text)
 
     return get_txml(generate_voice(reply))
 
+
 @router.post("/call-status")
 async def call_status(request: Request):
-    """Finalizing Billing & Automations after call ends."""
     form = await request.form()
     sid = form.get("CallSid")
-    status = form.get("CallStatus")
-    to_phone = form.get("To")
 
-    if status in ["completed", "failed"]:
-        cid = redis_db.get(f"call:customer:{sid}")
-        stop_call_billing(sid, cid)
-        
-        if status == "completed":
-            # Post-call followup
-            send_whatsapp(to_phone, "Thanks for talking to Visora AI! We have saved your request.")
-            
-    return {"status": "processed"}
+    stop_call_billing(sid, "user")
+    return {"status": "ok"}
 
 # =================================================================
-# WORKER LOGIC
+# WORKER
 # =================================================================
 def place_call(to_phone: str, from_phone: str, customer_id: str):
-    """Executed by Redis Worker."""
     try:
         call = twilio_client.calls.create(
-            machine_detection='Enable', # AMD Enabled
-            async_amd='true',
             to=to_phone,
-            from=from_phone,
+            from_=from_phone,  # ✅ IMPORTANT FIX
             url=f"{BASE_URL}/voice/twilio-voice",
-            status_callback=f"{BASE_URL}/voice/call-status",
-            status_callback_event=["completed"]
+            status_callback=f"{BASE_URL}/voice/call-status"
         )
-        # Link SID to User for billing
+
         redis_db.set(f"call:customer:{call.sid}", customer_id)
         start_call_billing(call.sid, customer_id)
+
+        return {"status": "success"}
+
     except TwilioRestException as e:
-        print(f"Twilio API Error: {e}")
+        print("Twilio Error:", e)
+        return {"status": "error"}
