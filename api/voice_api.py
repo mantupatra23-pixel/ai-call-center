@@ -1,161 +1,146 @@
-import os
-import json
-import redis
-from fastapi import APIRouter, Request, Query
+import os, json, redis, azure.cognitiveservices.speech as speechsdk
+from fastapi import APIRouter, Query, Request, HTTPException, Depends
 from fastapi.responses import PlainTextResponse
-from datetime import datetime
-from groq import Groq
+from rq import Queue
+from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
+from datetime import datetime, timedelta
+from groq import Groq  # Groq Integration
 
-# ================= ROUTER =================
+# Core & DB
+from db.redis import redis_db
+from core.auth_guard import get_current_user
+
+# Services Logic
+from services.ai_memory_service import add_call_memory, get_call_memory
+from services.billing_service import start_call_billing, stop_call_billing
+from services.sales_service import detect_sales_intent, upsell_reply
+
 router = APIRouter(prefix="/voice", tags=["Voice"])
 
-# ================= ENV =================
-TWILIO_SID = os.getenv("TWILIO_SID", "")
-TWILIO_TOKEN = os.getenv("TWILIO_TOKEN", "")
-TWILIO_NUMBER = os.getenv("TWILIO_NUMBER", "")
+# ==========================================
+# ENV LOADING
+# ==========================================
+TWILIO_SID = os.getenv("TWILIO_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
 BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
-REDIS_URL = os.getenv("REDIS_URL", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+AZURE_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_REGION = os.getenv("AZURE_SPEECH_REGION")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ================= SAFE INIT =================
-twilio_client = None
-try:
-    if TWILIO_SID and TWILIO_TOKEN:
-        from twilio.rest import Client
-        twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
-    else:
-        print("⚠️ Twilio ENV missing (app will still run)")
-except Exception as e:
-    print("Twilio init error:", e)
+# Clients Setup
+twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID else None
+redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
+call_queue = Queue("calls", connection=redis_conn)
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-redis_conn = None
-try:
-    if REDIS_URL:
-        redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
-except Exception as e:
-    print("Redis error:", e)
+# ==========================================
+# UTILS & AI BRAIN (Groq)
+# ==========================================
 
-groq_client = None
-try:
-    if GROQ_API_KEY:
-        groq_client = Groq(api_key=GROQ_API_KEY)
-    else:
-        print("⚠️ GROQ_API_KEY missing")
-except Exception as e:
-    print("Groq init error:", e)
-
-# ================= MEMORY =================
-def save_memory(call_sid, role, text):
-    if not redis_conn:
-        return
-    try:
-        redis_conn.rpush(f"call:{call_sid}", json.dumps({
-            "role": role,
-            "text": text
-        }))
-    except:
-        pass
-
-def get_memory(call_sid):
-    if not redis_conn:
-        return []
-    try:
-        data = redis_conn.lrange(f"call:{call_sid}", 0, -1)
-        return [json.loads(x) for x in data]
-    except:
-        return []
-
-# ================= AI =================
-def ai_reply(user_text: str, call_sid: str) -> str:
+def get_ai_reply(history: list, user_input: str) -> str:
+    """Groq Llama-3-70b se fast reply generate karta hai."""
     if not groq_client:
-        return "AI service abhi available nahi hai."
-
-    history = get_memory(call_sid)
-
-    messages = [
-        {"role": "system", "content": "You are a Hindi AI call assistant. Short polite replies."}
-    ]
-
+        return "Ji, main sun raha hoon. Kripya bolein."
+    
+    messages = [{"role": "system", "content": "You are a professional AI Assistant for Visora AI. Speak in natural Hinglish. Keep it short and human-like."}]
+    # Add history
     for h in history[-5:]:
-        messages.append({
-            "role": "assistant" if h["role"] == "AI" else "user",
-            "content": h["text"]
-        })
+        messages.append({"role": "user" if h['role'] == 'User' else "assistant", "content": h['text']})
+    messages.append({"role": "user", "content": user_input})
 
-    messages.append({"role": "user", "content": user_text})
+    completion = groq_client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=messages,
+        temperature=0.7,
+        max_tokens=150
+    )
+    return completion.choices[0].message.content
 
-    try:
-        res = groq_client.chat.completions.create(
-            model="llama3-8b-8192",
-            messages=messages
-        )
-        reply = res.choices[0].message.content
-    except Exception as e:
-        print("AI ERROR:", e)
-        reply = "System busy hai."
+def generate_voice(text: str) -> str:
+    voice_dir = "static/voice"
+    os.makedirs(voice_dir, exist_ok=True)
+    fname = f"v_{abs(hash(text))}.mp3"
+    path = f"{voice_dir}/{fname}"
+    full_path = os.path.join(os.getcwd(), path)
 
-    save_memory(call_sid, "AI", reply)
-    return reply
+    if not os.path.exists(full_path):
+        if not AZURE_KEY: return ""
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_KEY, region=AZURE_REGION)
+        audio_config = speechsdk.audio.AudioOutputConfig(filename=full_path)
+        speech_config.speech_synthesis_voice_name = "hi-IN-MadhurNeural"
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+        
+        ssml = f"<speak version='1.0' xml:lang='hi-IN'><voice name='hi-IN-MadhurNeural'><mstts:express-as style='cheerful'><prosody rate='-5%'>{text}</prosody></mstts:express-as></voice></speak>"
+        synthesizer.speak_ssml_async(ssml).get()
 
-# ================= TWIML =================
-def get_txml(text):
-    return f"""
-<Response>
-    <Say voice="Polly.Aditi" language="hi-IN">{text}</Say>
-    <Gather input="speech" action="/voice/process" method="POST"/>
-</Response>
-"""
+    return f"{BASE_URL}/{path}"
 
-# ================= ROUTES =================
-
-@router.get("/")
-def health():
-    return {
-        "status": "running",
-        "twilio": bool(twilio_client),
-        "groq": bool(groq_client)
-    }
-
-@router.post("/start", response_class=PlainTextResponse)
-async def start_call():
-    return get_txml("Namaste! Main AI assistant hoon.")
-
-@router.post("/process", response_class=PlainTextResponse)
-async def process(request: Request):
-    form = await request.form()
-    text = form.get("SpeechResult", "")
-    call_sid = form.get("CallSid", "test")
-
-    if not text:
-        return get_txml("Repeat karein please.")
-
-    save_memory(call_sid, "User", text)
-    reply = ai_reply(text, call_sid)
-
-    return get_txml(reply)
-
-# ================= CALL FUNCTION =================
-def place_call(to: str, from_: str):
-    if not twilio_client:
-        print("❌ Twilio not configured (skip call)")
-        return None
-
+# Important for app.py imports
+def place_call(to_phone: str, from_phone: str, customer_id: str):
+    if not twilio_client: return print("Twilio not set")
     try:
         call = twilio_client.calls.create(
-            to=to,
-            from_=from_,
-            url=f"{BASE_URL}/voice/start"
+            machine_detection='Enable',
+            to=to_phone,
+            from_=from_phone,
+            url=f"{BASE_URL}/voice/twilio-voice"
         )
-        return call.sid
+        redis_db.set(f"call:customer:{call.sid}", customer_id)
+        start_call_billing(call.sid, customer_id)
     except Exception as e:
-        print("CALL ERROR:", e)
-        return None
+        print(f"Call Error: {e}")
 
-# ================= TEST API =================
-@router.get("/make-call")
-def make_call(to: str = Query(...)):
-    sid = place_call(to, TWILIO_NUMBER)
-    return {
-        "success": bool(sid),
-        "call_sid": sid
-    }
+# ==========================================
+# ROUTES
+# ==========================================
+
+@router.post("/twilio-voice", response_class=PlainTextResponse)
+async def twilio_voice():
+    welcome = "Namaskar! Main Visora AI se baat kar raha hoon. Kya main aapki koi madad kar sakta hoon?"
+    audio = generate_voice(welcome)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Play>{audio}</Play>
+        <Gather input="speech" timeout="5" action="{BASE_URL}/voice/process-speech" method="POST" interruptible="true"/>
+    </Response>"""
+
+@router.post("/process-speech", response_class=PlainTextResponse)
+async def process_speech(request: Request):
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    user_text = (form.get("SpeechResult") or "").strip()
+    
+    if not user_text:
+        return f'<Response><Play>{generate_voice("Maaf kijiye, main sun nahi paaya.")}</Play><Gather input="speech" action="{BASE_URL}/voice/process-speech"/></Response>'
+
+    # Memory & AI Logic
+    add_call_memory(call_sid, "User", user_text)
+    history = get_call_memory(call_sid)
+    
+    # 1. Check Sales Intent
+    intent = detect_sales_intent(user_text)
+    reply = upsell_reply(intent)
+    
+    # 2. If no sales reply, use Groq
+    if not reply:
+        reply = get_ai_reply(history, user_text)
+
+    add_call_memory(call_sid, "AI", reply)
+    audio = generate_voice(reply)
+
+    return f"""<Response>
+        <Play>{audio}</Play>
+        <Gather input="speech" action="{BASE_URL}/voice/process-speech" method="POST" interruptible="true"/>
+    </Response>"""
+
+@router.post("/call-status")
+async def call_status(request: Request):
+    form = await request.form()
+    sid = form.get("CallSid")
+    status = form.get("CallStatus")
+    if status in ["completed", "failed"]:
+        cid = redis_db.get(f"call:customer:{sid}")
+        stop_call_billing(sid, cid)
+    return {"status": "ok"}
