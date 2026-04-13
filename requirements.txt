@@ -28,4 +28,4 @@ azure-cognitiveservices-speech
 
 # Optional but recommended
 httpx
-openai
+groq
