@@ -30,3 +30,4 @@ azure-cognitiveservices-speech
 httpx
 groq
 pytz
+reportlab
