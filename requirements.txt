@@ -31,3 +31,4 @@ httpx
 groq
 pytz
 reportlab
+razorpay
