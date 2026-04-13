@@ -1,11 +1,9 @@
-# api/twilio_webhook_api.py
-
 import time
 from fastapi import APIRouter, Request
 
 from services.billing_service import (
     start_call_billing,
-    end_call_billing,
+    stop_call_billing,  # FIXED: Updated name
 )
 
 from services.call_log_service import (
@@ -30,9 +28,9 @@ from services.active_call_service import remove_active_call
 
 router = APIRouter(prefix="/twilio", tags=["Twilio"])
 
-# =====================================================
+# ==========================================
 # TWILIO CALL STATUS WEBHOOK
-# =====================================================
+# ==========================================
 @router.post("/call-status")
 async def call_status(request: Request):
     """
@@ -54,16 +52,16 @@ async def call_status(request: Request):
     call = get_call(call_sid)
     customer_id = call["customer_id"] if call else None
 
-    # =====================================================
+    # ==========================================
     # IDEMPOTENCY (ANTI DOUBLE BILLING)
-    # =====================================================
+    # ==========================================
     unique_key = f"{call_sid}:{call_status}"
     if is_processed(unique_key):
         return {"ok": True, "duplicate": True}
 
-    # =====================================================
-    # RINGING / IN-PROGRESS → START BILLING SESSION
-    # =====================================================
+    # ==========================================
+    # RINGING / IN-PROGRESS -> START BILLING SESSION
+    # ==========================================
     if call_status in ("ringing", "in-progress"):
         start_call_billing(call_sid, customer_id)
 
@@ -75,26 +73,27 @@ async def call_status(request: Request):
             "status": call_status,
             "duration_sec": 0,
             "cost": 0.0,
-            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S")
         })
 
-    # =====================================================
-    # COMPLETED → FINAL BILLING
-    # =====================================================
+    # ==========================================
+    # COMPLETED -> FINAL BILLING
+    # ==========================================
     elif call_status == "completed":
-        bill = end_call_billing(call_sid)
+        bill = stop_call_billing(call_sid)  # FIXED: Updated function call
 
         update_call_log(call_sid, {
             "status": "completed",
             "duration_sec": duration,
             "cost": bill["cost"] if bill else 0,
-            "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "completed_at": time.strftime("%Y-%m-%d %H:%M:%S")
         })
 
-        # 🔔 Low balance alert
-        balance = get_balance(customer_id)
-        if balance < 50:
-            notify_low_balance(customer_id, balance)
+        # 🔔 Low balance alert (Added safe check for customer_id)
+        if customer_id:
+            balance = get_balance(customer_id)
+            if balance < 50:
+                notify_low_balance(customer_id, balance)
 
         # 🧹 Cleanup registry
         delete_call(call_sid)
@@ -102,13 +101,13 @@ async def call_status(request: Request):
         # 🔴 REMOVE ACTIVE CALL (LIVE DASHBOARD)
         remove_active_call(call_sid)
 
-    # =====================================================
+    # ==========================================
     # FAILED / BUSY / NO-ANSWER
-    # =====================================================
+    # ==========================================
     elif call_status in ("failed", "busy", "no-answer"):
         update_call_log(call_sid, {
             "status": call_status,
-            "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "completed_at": time.strftime("%Y-%m-%d %H:%M:%S")
         })
 
         delete_call(call_sid)
@@ -116,9 +115,9 @@ async def call_status(request: Request):
         # 🔴 REMOVE ACTIVE CALL
         remove_active_call(call_sid)
 
-    # =====================================================
+    # ==========================================
     # MARK PROCESSED (VERY IMPORTANT)
-    # =====================================================
+    # ==========================================
     mark_processed(unique_key)
 
     return {
