@@ -1,21 +1,21 @@
-# services/ai_agent_service.py
-
 import os
-from openai import OpenAI
+from groq import Groq
 
+# Memory (same use karenge)
 from services.ai_memory_service import (
     get_summary,
     add_customer_memory,
 )
 
 # =========================
-# OPENAI CLIENT
+# GROQ CLIENT
 # =========================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY missing")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+if not GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY missing")
+
+client = Groq(api_key=GROQ_API_KEY)
 
 # =========================
 # AI AGENT REPLY
@@ -33,6 +33,9 @@ def ai_reply(
     - Short polite responses
     """
 
+    # =========================
+    # SYSTEM PROMPT
+    # =========================
     system_prompt = f"""
 You are an AI call center voice agent.
 
@@ -60,18 +63,23 @@ Rules:
             system_prompt += f"\nCustomer Past Context:\n{summary}\n"
 
     # =========================
-    # OPENAI CALL
+    # GROQ CALL
     # =========================
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": user_text}
-        ],
-        temperature=0.4
-    )
+    try:
+        response = client.chat.completions.create(
+            model="llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text}
+            ],
+            temperature=0.4
+        )
 
-    reply = response.choices[0].message.content.strip()
+        reply = response.choices[0].message.content.strip()
+
+    except Exception as e:
+        print("Groq Error:", e)
+        reply = "Maaf kijiye, system me thodi problem hai."
 
     # =========================
     # SAVE MEMORY
