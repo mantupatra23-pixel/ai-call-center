@@ -15,11 +15,15 @@ rq
 pydantic
 python-dotenv
 
-# TTS (Google + ElevenLabs via requests)
+# Security (LOGIN / AUTH)
+passlib[bcrypt]
+bcrypt
+python-jose[cryptography]
+
+# TTS (Google + ElevenLabs + Azure)
 gtts
 google-cloud-texttospeech
+azure-cognitiveservices-speech
 
 # Optional but recommended
 httpx
-python-jose[cryptography]
-azure-cognitiveservices-speech
