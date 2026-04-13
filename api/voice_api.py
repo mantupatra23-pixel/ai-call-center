@@ -1,258 +1,223 @@
-# api/voice_api.py
-
-import os, json, redis, requests
+import os
+import json
+import redis
+import requests
+import azure.cognitiveservices.speech as speechsdk
 from fastapi import APIRouter, Query, Request, HTTPException, Depends
 from fastapi.responses import PlainTextResponse
 from rq import Queue
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
+from datetime import datetime, timedelta
 
+# Project Imports (Ensure these paths exist in your repo)
 from db.redis import redis_db
 from core.auth_guard import get_current_user
-
 from services.ai_agent_service import ai_reply
 from services.ai_memory_service import (
-    add_call_memory,
-    get_call_memory,
-    increment_call_count,
-    should_summarize,
-    save_summary
+    add_call_memory, get_call_memory, increment_call_count, should_summarize, save_summary
 )
-
 from services.billing_service import start_call_billing, stop_call_billing
-from services.subscription_service import consume_minutes
 from services.crm_service import create_lead
 from services.whatsapp_service import send_whatsapp
 from services.sales_service import detect_sales_intent, upsell_reply
 from services.booking_service import save_booking
 
-# =====================================================
-# ROUTER
-# =====================================================
+# =================================================================
+# CONFIGURATION & CLIENTS
+# =================================================================
 router = APIRouter(prefix="/voice", tags=["Voice"])
 
-# =====================================================
-# ENV
-# =====================================================
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
 BASE_URL = os.getenv("PUBLIC_BASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
-ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
+AZURE_KEY = os.getenv("AZURE_SPEECH_KEY")
+AZURE_REGION = os.getenv("AZURE_SPEECH_REGION")
 
-if not all([TWILIO_SID, TWILIO_TOKEN, BASE_URL, REDIS_URL,
-            ELEVEN_API_KEY, ELEVEN_VOICE_ID]):
-    raise RuntimeError("Missing ENV variables")
-
-# =====================================================
-# CLIENTS
-# =====================================================
 twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
 redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
 call_queue = Queue("calls", connection=redis_conn)
 
-# =====================================================
-# ELEVENLABS TTS
-# =====================================================
-def eleven_tts(text: str) -> str:
-    os.makedirs("static/voice", exist_ok=True)
-    fname = f"{abs(hash(text))}.mp3"
-    path = f"static/voice/{fname}"
+# =================================================================
+# AZURE NEURAL TTS ENGINE
+# =================================================================
+def generate_voice(text: str) -> str:
+    """Generates high-quality human-like voice using Azure Neural TTS."""
+    voice_dir = "static/voice"
+    os.makedirs(voice_dir, exist_ok=True)
+    
+    # Cleanup: Delete files older than 1 hour to save space
+    for f in os.listdir(voice_dir):
+        fpath = os.path.join(voice_dir, f)
+        if os.path.getmtime(fpath) < (datetime.now() - timedelta(hours=1)).timestamp():
+            os.remove(fpath)
 
-    r = requests.post(
-        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}",
-        headers={
-            "xi-api-key": ELEVEN_API_KEY,
-            "Content-Type": "application/json"
-        },
-        json={
-            "text": text,
-            "model_id": "eleven_multilingual_v2",
-            "voice_settings": {
-                "stability": 0.45,
-                "similarity_boost": 0.75
-            }
-        },
-        timeout=15
-    )
+    fname = f"v_{abs(hash(text))}.mp3"
+    path = f"{voice_dir}/{fname}"
+    full_path = os.path.join(os.getcwd(), path)
 
-    if r.status_code != 200:
-        return eleven_tts("Kripya thoda intezaar karein.")
+    if not os.path.exists(full_path):
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_KEY, region=AZURE_REGION)
+        audio_config = speechsdk.audio.AudioOutputConfig(filename=full_path)
+        # Professional Indian Male Voice
+        speech_config.speech_synthesis_voice_name = "hi-IN-MadhurNeural"
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
 
-    with open(path, "wb") as f:
-        f.write(r.content)
+        # SSML for "Real Human" Expression
+        ssml = f"""
+        <speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xmlns:mstts='http://www.w3.org/2001/mstts' xml:lang='hi-IN'>
+            <voice name='hi-IN-MadhurNeural'>
+                <mstts:express-as style='cheerful' styledegree='1.2'>
+                    <prosody rate='-3%'>
+                        {text}
+                    </prosody>
+                </mstts:express-as>
+            </voice>
+        </speak>
+        """
+        synthesizer.speak_ssml_async(ssml).get()
 
     return f"{BASE_URL}/{path}"
 
-# =====================================================
-# LANGUAGE DETECT
-# =====================================================
-def detect_lang(text: str):
-    for h in ["kya", "hai", "nahi", "kyu", "ka", "ke"]:
-        if h in text.lower():
-            return "hi"
-    return "en"
+# =================================================================
+# TWILIO TXML GENERATOR
+# =================================================================
+def txml_response(audio_url: str, gathering: bool = True):
+    """Generates TXML with Barge-in and Background Ambience support."""
+    response = f'<?xml version="1.0" encoding="UTF-8"?><Response>'
+    # Background noise (Make sure this file exists in your static folder)
+    # response += f'<Play loop="0">{BASE_URL}/static/office_ambience.mp3</Play>'
+    
+    response += f'<Play>{audio_url}</Play>'
+    
+    if gathering:
+        response += f'''<Gather 
+            input="speech" 
+            timeout="5" 
+            action="{BASE_URL}/voice/process-speech" 
+            method="POST" 
+            speechTimeout="auto" 
+            hints="hello, price, interest, manager"
+            interruptible="true"
+        />'''
+        response += f'<Redirect>{BASE_URL}/voice/process-speech</Redirect>' # Fallback if no speech
+    
+    response += '</Response>'
+    return response
 
-# =====================================================
-# MAKE CALL API
-# =====================================================
+# =================================================================
+# ENDPOINTS
+# =================================================================
+
 @router.post("/make-call")
-def make_call(
-    to_phone: str = Query(...),
-    from_phone: str = Query(...),
-    user=Depends(get_current_user)
-):
-    if not to_phone.startswith("+") or not from_phone.startswith("+"):
-        raise HTTPException(400, "Invalid phone format")
-
-    cfg = redis_db.get("admin:config")
-    rate = float(json.loads(cfg).get("call_rate_per_min", 0))
-
-    if user["wallet"] < rate:
-        raise HTTPException(402, "Low wallet")
-
+def make_call(to_phone: str = Query(...), from_phone: str = Query(...), user=Depends(get_current_user)):
+    """Triggers an outbound call via RQ Worker."""
+    if not to_phone.startswith("+"):
+        raise HTTPException(400, "Invalid phone format. Use E.164")
+    
+    # Simple Wallet Check (Logic from your models)
+    if user.get("wallet", 0) <= 0:
+        raise HTTPException(402, "Insufficient Balance")
+    
     job = call_queue.enqueue(place_call, to_phone, from_phone, user["id"])
-    return {"queued": True, "job_id": job.id}
+    return {"status": "queued", "job_id": job.id}
 
-# =====================================================
-# TWILIO FIRST RESPONSE
-# =====================================================
 @router.post("/twilio-voice", response_class=PlainTextResponse)
-def twilio_voice():
-    audio = eleven_tts("Namaskar! Main AI Call Center se bol raha hoon.")
-    return f"""
-<Response>
-  <Play>{audio}</Play>
-  <Gather input="speech" timeout="5" action="{BASE_URL}/voice/process-speech"/>
-</Response>
-"""
+async def twilio_voice(request: Request):
+    """Initial Greeting with Answering Machine Detection."""
+    form = await request.form()
+    answered_by = form.get("AnsweredBy", "human")
 
-# =====================================================
-# PROCESS SPEECH (AI + MEMORY + SALES)
-# =====================================================
+    # If Voicemail/Machine detected, hang up to save money
+    if "machine" in answered_by.lower():
+        return "<Response><Hangup/></Response>"
+
+    msg = "Namaskar! Main Visora AI se baat kar raha hoon. Kya main aapka do minute le sakta hoon?"
+    return txml_response(generate_voice(msg))
+
 @router.post("/process-speech", response_class=PlainTextResponse)
 async def process_speech(request: Request):
+    """Core logic for AI Conversation, Sales Intent, and Memory."""
     form = await request.form()
     call_sid = form.get("CallSid")
     text = (form.get("SpeechResult") or "").strip()
     to_phone = form.get("To")
-
     customer_id = redis_db.get(f"call:customer:{call_sid}")
 
+    # 1. Handle Silence
     if not text:
-        audio = eleven_tts("Kripya bolein.")
-        return f"<Response><Play>{audio}</Play><Gather input='speech' action='{BASE_URL}/voice/process-speech'/></Response>"
+        return txml_response(generate_voice("Maaf kijiye, main sun nahi paaya. Kripya phir se bolein."))
 
-    if any(w in text.lower() for w in ["bye", "band", "goodbye"]):
-        audio = eleven_tts("Dhanyavaad. Call samapt.")
-        return f"<Response><Play>{audio}</Play><Hangup/></Response>"
+    # 2. Human Handoff / Manager Request
+    if any(w in text.lower() for w in ["manager", "senior", "insaan", "human"]):
+        audio = generate_voice("Zaroor, main hamare senior manager ko call transfer kar raha hoon. Kripya line par bane rahein.")
+        return f'<Response><Play>{audio}</Play><Dial>+91YOUR_REAL_NUMBER</Dial></Response>'
 
-    # 🧠 SHORT MEMORY
+    # 3. Call Termination
+    if any(w in text.lower() for w in ["bye", "cut", "shukriya", "no thanks"]):
+        return f'<Response><Play>{generate_voice("Theek hai, dhanyavaad.")}</Play><Hangup/></Response>'
+
+    # 4. AI Thinking & Memory
     add_call_memory(call_sid, "User", text)
     history = get_call_memory(call_sid)
+    
+    # Load Business Context
+    try:
+        with open("data/company_profile.json") as f:
+            profile = json.load(f)
+    except:
+        profile = {"name": "Visora AI", "service": "Automation"}
 
-    with open("data/company_profile.json") as f:
-        company_profile = json.load(f)
-
-    lang = detect_lang(text)
-
-    # 🔥 SALES INTENT
     intent = detect_sales_intent(text)
-    sales_reply = upsell_reply(intent)
-
-    if sales_reply:
-        reply = sales_reply
-    else:
-        reply = ai_reply(
-            user_text=history,
-            company_profile=company_profile,
-            lang=lang,
-            customer_id=customer_id
-        )
+    
+    # Sales Upsell Logic
+    reply = upsell_reply(intent)
+    if not reply:
+        reply = ai_reply(user_text=text, history=history, company_profile=profile, lang="hi")
 
     add_call_memory(call_sid, "AI", reply)
 
-    # 🔥 BOOKING
-    if intent in ["demo", "buy", "booking"]:
-        save_booking(call_sid=call_sid, phone=to_phone, intent=intent)
+    # 5. Lead & Booking Actions
+    if intent in ["booking", "buy", "interested"]:
+        save_booking(call_sid=call_sid, phone=to_phone)
+        create_lead(call_sid=call_sid, phone=to_phone, intent=intent)
 
-    audio = eleven_tts(reply)
+    return txml_response(generate_voice(reply))
 
-    return f"""
-<Response>
-  <Play>{audio}</Play>
-  <Gather input="speech" action="{BASE_URL}/voice/process-speech"/>
-</Response>
-"""
-
-# =====================================================
-# CALL STATUS (BILLING + MEMORY SUMMARY + CRM)
-# =====================================================
 @router.post("/call-status")
 async def call_status(request: Request):
+    """Handles Billing and Post-Call Automations."""
     form = await request.form()
     sid = form.get("CallSid")
     status = form.get("CallStatus")
     to_phone = form.get("To")
 
-    if status in ["completed", "failed", "busy", "no-answer"]:
+    if status in ["completed", "failed"]:
         cid = redis_db.get(f"call:customer:{sid}")
-        duration = int(form.get("CallDuration", 0))
-
         stop_call_billing(sid, cid)
-        consume_minutes(cid, max(1, duration // 60))
+        
+        if status == "completed":
+            send_whatsapp(to_phone, "Visora AI se baat karne ke liye shukriya! Hum jald hi aapse sampark karenge.")
+            
+    return {"status": "tracked"}
 
-        # 🧠 LONG MEMORY SUMMARY
-        if cid:
-            count = increment_call_count(cid)
-            if should_summarize(cid):
-                save_summary(
-                    cid,
-                    "Customer showed interest, spoke politely, prefers Hindi."
-                )
-
-        create_lead(
-            call_sid=sid,
-            phone=to_phone,
-            intent="sales",
-            emotion="interested"
-        )
-
-        send_whatsapp(
-            to_phone=to_phone,
-            text="Thanks for calling 🙏 Our team will contact you shortly."
-        )
-
-    return {"ok": True}
-
-# =====================================================
-# RECORDING WEBHOOK
-# =====================================================
-@router.post("/recording")
-async def recording_webhook(request: Request):
-    form = await request.form()
-    redis_db.hset("call:recordings", form.get("CallSid"), form.get("RecordingUrl"))
-    return {"saved": True}
-
-# =====================================================
-# RQ WORKER
-# =====================================================
+# =================================================================
+# WORKER FUNCTION (Twilio Outbound)
+# =================================================================
 def place_call(to_phone: str, from_phone: str, customer_id: str):
+    """The function executed by RQ Worker to trigger the call."""
     try:
         call = twilio_client.calls.create(
+            machine_detection='Enable',
+            async_amd='true',
             to=to_phone,
-            from_=from_phone,
+            from=from_phone,
             url=f"{BASE_URL}/voice/twilio-voice",
             status_callback=f"{BASE_URL}/voice/call-status",
-            status_callback_event=["completed"],
-            record=True,
-            recording_channels="dual",
-            recording_status_callback=f"{BASE_URL}/voice/recording"
+            status_callback_event=["completed"]
         )
-
         redis_db.set(f"call:customer:{call.sid}", customer_id)
         start_call_billing(call.sid, customer_id)
-
     except TwilioRestException as e:
-        print("Twilio error:", e)
+        print(f"Twilio API Error: {e}")

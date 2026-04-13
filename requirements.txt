@@ -22,3 +22,4 @@ google-cloud-texttospeech
 # Optional but recommended
 httpx
 python-jose[cryptography]
+azure-cognitiveservices-speech
