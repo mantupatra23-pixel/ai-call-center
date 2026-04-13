@@ -1,25 +1,23 @@
 import os
 import json
 import redis
-import azure.cognitiveservices.speech as speechsdk
-from fastapi import APIRouter, Query, Request, HTTPException, Depends
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Request, Query, HTTPException, Depends
 from fastapi.responses import PlainTextResponse
 from rq import Queue
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
-from datetime import datetime, timedelta
+import azure.cognitiveservices.speech as speechsdk
 from groq import Groq
 
-# Core
+# ================= CORE =================
 from db.redis import redis_db
 from core.auth_guard import get_current_user
 
-# Services
-from services.sales_service import detect_sales_intent, upsell_reply
-
 router = APIRouter(prefix="/voice", tags=["Voice"])
 
-# ================== ENV ==================
+# ================= ENV =================
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
 BASE_URL = os.getenv("PUBLIC_BASE_URL")
@@ -28,155 +26,188 @@ AZURE_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_REGION = os.getenv("AZURE_SPEECH_REGION")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-if not GROQ_API_KEY:
-    raise Exception("❌ GROQ_API_KEY missing")
+# ================= SAFE INIT =================
+twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
+redis_conn = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+call_queue = Queue("calls", connection=redis_conn) if redis_conn else None
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-twilio_client = Client(TWILIO_SID, TWILIO_TOKEN)
-redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
-call_queue = Queue("calls", connection=redis_conn)
-
-groq_client = Groq(api_key=GROQ_API_KEY)
-
-# ================== MEMORY ==================
+# ================= MEMORY =================
 def save_memory(call_sid, role, text):
-    redis_conn.rpush(f"call:{call_sid}", json.dumps({"role": role, "text": text}))
+    if redis_conn:
+        redis_conn.rpush(f"call:{call_sid}", json.dumps({
+            "role": role,
+            "text": text,
+            "time": str(datetime.now())
+        }))
 
 def get_memory(call_sid):
+    if not redis_conn:
+        return []
     data = redis_conn.lrange(f"call:{call_sid}", 0, -1)
     return [json.loads(x) for x in data]
 
-# ================== AI ==================
+# ================= AI =================
 def ai_reply(user_text: str, call_sid: str) -> str:
+    if not groq_client:
+        return "System error: AI not configured"
+
     history = get_memory(call_sid)
 
-    messages = [{"role": "system", "content": "You are a smart Hindi AI sales caller."}]
-    
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a smart Hindi AI call center agent. Speak politely, short, and sales focused."
+        }
+    ]
+
     for h in history[-5:]:
-        messages.append({"role": "user" if h["role"]=="User" else "assistant", "content": h["text"]})
+        messages.append({"role": "user", "content": h["text"]})
 
     messages.append({"role": "user", "content": user_text})
 
     try:
         response = groq_client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=messages
+            model="llama3-8b-8192",
+            messages=messages,
+            temperature=0.5
         )
-        reply = response.choices[0].message.content
-        save_memory(call_sid, "AI", reply)
-        return reply
-    except Exception as e:
-        print("Groq Error:", e)
-        return "System error, please try later."
 
-# ================== AZURE VOICE ==================
+        reply = response.choices[0].message.content.strip()
+
+    except Exception as e:
+        print("AI ERROR:", e)
+        reply = "Maaf kijiye, kuch error aa gaya."
+
+    save_memory(call_sid, "user", user_text)
+    save_memory(call_sid, "ai", reply)
+
+    return reply
+
+# ================= AZURE VOICE =================
 def generate_voice(text: str) -> str:
+    if not AZURE_KEY or not AZURE_REGION:
+        return ""
+
     voice_dir = "static/voice"
     os.makedirs(voice_dir, exist_ok=True)
 
-    fname = f"v_{abs(hash(text))}.mp3"
-    path = f"{voice_dir}/{fname}"
-    full_path = os.path.join(os.getcwd(), path)
-
     # cleanup old files
     for f in os.listdir(voice_dir):
-        fpath = os.path.join(voice_dir, f)
-        if os.path.getmtime(fpath) < (datetime.now() - timedelta(minutes=20)).timestamp():
-            try: os.remove(fpath)
-            except: pass
+        path = os.path.join(voice_dir, f)
+        if os.path.isfile(path):
+            if os.path.getmtime(path) < (datetime.now() - timedelta(minutes=30)).timestamp():
+                try:
+                    os.remove(path)
+                except:
+                    pass
 
-    if not os.path.exists(full_path):
-        speech_config = speechsdk.SpeechConfig(subscription=AZURE_KEY, region=AZURE_REGION)
-        audio_config = speechsdk.audio.AudioOutputConfig(filename=full_path)
+    fname = f"v_{abs(hash(text))}.mp3"
+    file_path = os.path.join(voice_dir, fname)
 
-        speech_config.speech_synthesis_voice_name = "hi-IN-MadhurNeural"
+    if not os.path.exists(file_path):
+        try:
+            speech_config = speechsdk.SpeechConfig(subscription=AZURE_KEY, region=AZURE_REGION)
+            audio_config = speechsdk.audio.AudioOutputConfig(filename=file_path)
 
-        synthesizer = speechsdk.SpeechSynthesizer(
-            speech_config=speech_config,
-            audio_config=audio_config
-        )
+            speech_config.speech_synthesis_voice_name = "hi-IN-MadhurNeural"
 
-        synthesizer.speak_text_async(text).get()
+            synthesizer = speechsdk.SpeechSynthesizer(
+                speech_config=speech_config,
+                audio_config=audio_config
+            )
 
-    return f"{BASE_URL}/{path}"
+            synthesizer.speak_text_async(text).get()
 
-# ================== TWILIO XML ==================
-def get_txml(audio_url: str):
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-<Play>{audio_url}</Play>
-<Gather input="speech" action="{BASE_URL}/voice/process-speech" method="POST" speechTimeout="auto"/>
-</Response>
-"""
+        except Exception as e:
+            print("TTS ERROR:", e)
+            return ""
 
-# ================== API ==================
+    return f"{BASE_URL}/{voice_dir}/{fname}"
+
+# ================= TWILIO XML =================
+def get_txml(audio_url: str, gather=True):
+    xml = '<?xml version="1.0" encoding="UTF-8"?><Response>'
+
+    if audio_url:
+        xml += f"<Play>{audio_url}</Play>"
+
+    if gather:
+        xml += f'''
+        <Gather 
+            input="speech"
+            action="{BASE_URL}/voice/process"
+            method="POST"
+            timeout="4"
+            speechTimeout="auto"
+        />
+        <Redirect>{BASE_URL}/voice/process</Redirect>
+        '''
+
+    xml += "</Response>"
+    return xml
+
+# ================= API =================
 
 @router.post("/make-call")
 def make_call(
-    to_phone: str = Query(...),
-    from_phone: str = Query(...),
+    to: str = Query(...),
+    from_: str = Query(...),
     user=Depends(get_current_user)
 ):
-    if not to_phone.startswith("+"):
-        raise HTTPException(400, "Use +91 format")
+    if not twilio_client:
+        raise HTTPException(500, "Twilio not configured")
 
-    job = call_queue.enqueue(place_call, to_phone, from_phone, user["id"])
-    return {"status": "queued", "job_id": job.id}
+    try:
+        job = call_queue.enqueue(place_call, to, from_)
+        return {"status": "queued", "job_id": job.id}
+    except Exception as e:
+        return {"error": str(e)}
 
-
-@router.post("/twilio-voice", response_class=PlainTextResponse)
-async def twilio_voice(request: Request):
-    form = await request.form()
-    call_sid = form.get("CallSid")
-
+@router.post("/start", response_class=PlainTextResponse)
+async def start():
     msg = "Namaste! Main AI call assistant bol raha hoon. Kya main aapse baat kar sakta hoon?"
-    save_memory(call_sid, "AI", msg)
+    audio = generate_voice(msg)
+    return get_txml(audio)
 
-    return get_txml(generate_voice(msg))
-
-
-@router.post("/process-speech", response_class=PlainTextResponse)
-async def process_speech(request: Request):
+@router.post("/process", response_class=PlainTextResponse)
+async def process(request: Request):
     form = await request.form()
 
     call_sid = form.get("CallSid")
-    text = (form.get("SpeechResult") or "").strip()
+    speech = (form.get("SpeechResult") or "").strip()
 
-    if not text:
-        return get_txml(generate_voice("Mujhe sunayi nahi diya, please dobara boliye."))
+    if not speech:
+        reply = "Mujhe sunayi nahi diya, please dubara boliye."
+    else:
+        if any(x in speech.lower() for x in ["bye", "band", "nahi", "no"]):
+            return "<Response><Hangup/></Response>"
 
-    save_memory(call_sid, "User", text)
+        reply = ai_reply(speech, call_sid)
 
-    # exit condition
-    if any(x in text.lower() for x in ["bye", "band", "nahi", "stop"]):
-        return f'<Response><Say>Dhanyavaad!</Say><Hangup/></Response>'
+    audio = generate_voice(reply)
+    return get_txml(audio)
 
-    # sales intent
-    intent = detect_sales_intent(text)
-    reply = upsell_reply(intent)
-
-    if not reply:
-        reply = ai_reply(text, call_sid)
-
-    return get_txml(generate_voice(reply))
-
-
-@router.post("/call-status")
+@router.post("/status")
 async def call_status(request: Request):
-    return {"status": "ok"}
+    form = await request.form()
+    print("CALL STATUS:", dict(form))
+    return {"ok": True}
 
-# ================== WORKER ==================
-def place_call(to_phone: str, from_phone: str, customer_id: str):
+# ================= WORKER =================
+def place_call(to, from_):
+    if not twilio_client:
+        print("Twilio not configured")
+        return
+
     try:
         call = twilio_client.calls.create(
-            to=to_phone,
-            from_=from_phone,
-            url=f"{BASE_URL}/voice/twilio-voice",
-            status_callback=f"{BASE_URL}/voice/call-status"
+            to=to,
+            from_=from_,
+            url=f"{BASE_URL}/voice/start",
+            status_callback=f"{BASE_URL}/voice/status"
         )
-
-        redis_db.set(f"call:customer:{call.sid}", customer_id)
-        return {"status": "success"}
+        print("CALL STARTED:", call.sid)
 
     except TwilioRestException as e:
-        print("Twilio Error:", e)
-        return {"status": "error"}
+        print("TWILIO ERROR:", e)
