@@ -14,6 +14,7 @@ rq
 # Environment & Validation
 pydantic
 python-dotenv
+email-validator
 
 # Security (LOGIN / AUTH)
 passlib[bcrypt]
