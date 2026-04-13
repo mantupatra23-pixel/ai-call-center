@@ -29,3 +29,4 @@ azure-cognitiveservices-speech
 # Optional but recommended
 httpx
 groq
+pytz
