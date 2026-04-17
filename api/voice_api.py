@@ -1,53 +1,51 @@
-import os, json, redis, azure.cognitiveservices.speech as speechsdk
-from fastapi import APIRouter, Query, Request, HTTPException, Depends
-from fastapi.responses import PlainTextResponse
-from rq import Queue
-from twilio.rest import Client
-from twilio.base.exceptions import TwilioRestException
-from datetime import datetime, timedelta
-from groq import Groq  # Groq Integration
+import os
+import json
+import requests
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
+from groq import Groq
 
-# Core & DB
+# Core & DB Imports
 from db.redis import redis_db
 from core.auth_guard import get_current_user
 
-# Services Logic
-from services.ai_memory_service import add_call_memory, get_call_memory
-from services.billing_service import start_call_billing, stop_call_billing
-from services.sales_service import detect_sales_intent, upsell_reply
+# Services Logic (Ensure these files exist in your services folder)
+from services.ai_memory_service import add_call_memory
+from services.billing_service import start_call_bill, stop_call_billing
+from services.sales_service import detect_sales_intent
 
 router = APIRouter(prefix="/voice", tags=["Voice"])
 
 # ==========================================
 # ENV LOADING
 # ==========================================
-TWILIO_SID = os.getenv("TWILIO_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_TOKEN")
-BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-AZURE_KEY = os.getenv("AZURE_SPEECH_KEY")
-AZURE_REGION = os.getenv("AZURE_SPEECH_REGION")
+VAPI_API_KEY = os.getenv("VAPI_API_KEY")
+VAPI_ASSISTANT_ID = os.getenv("VAPI_ASSISTANT_ID")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
 
-# Clients Setup
-twilio_client = Client(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID else None
-redis_conn = redis.from_url(REDIS_URL, decode_responses=True)
-call_queue = Queue("calls", connection=redis_conn)
+# ==========================================
+# CLIENTS SETUP
+# ==========================================
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# ==========================================
-# UTILS & AI BRAIN (Groq)
-# ==========================================
+class CallRequest(BaseModel):
+    to_phone: str
+    customer_id: str
 
+# ==========================================
+# AI BRAIN (Groq Llama-3-70b)
+# ==========================================
 def get_ai_reply(history: list, user_input: str) -> str:
-    """Groq Llama-3-70b se fast reply generate karta hai."""
+    """
+    Optional: Custom processing agar Vapi ke bahar reply chahiye.
+    """
     if not groq_client:
-        return "Ji, main sun raha hoon. Kripya bolein."
-    
-    messages = [{"role": "system", "content": "You are a professional AI Assistant for Visora AI. Speak in natural Hinglish. Keep it short and human-like."}]
-    # Add history
+        return "Ji, main sun raha hoon. Kripya boliye."
+
+    messages = [{"role": "system", "content": "You are Ananya, a helpful AI from Visora AI. Speak naturally in Hindi-English mix."}]
     for h in history[-5:]:
-        messages.append({"role": "user" if h['role'] == 'User' else "assistant", "content": h['text']})
+        messages.append(h)
     messages.append({"role": "user", "content": user_input})
 
     completion = groq_client.chat.completions.create(
@@ -58,89 +56,108 @@ def get_ai_reply(history: list, user_input: str) -> str:
     )
     return completion.choices[0].message.content
 
-def generate_voice(text: str) -> str:
-    voice_dir = "static/voice"
-    os.makedirs(voice_dir, exist_ok=True)
-    fname = f"v_{abs(hash(text))}.mp3"
-    path = f"{voice_dir}/{fname}"
-    full_path = os.path.join(os.getcwd(), path)
+# ==========================================
+# VAPI CALL ENGINE (Twilio Bypass)
+# ==========================================
+def place_vapi_call(to_phone: str, customer_id: str):
+    """
+    Directly triggers a high-speed AI call using Vapi.ai
+    """
+    url = "https://api.vapi.ai/call/phone"
+    
+    payload = {
+        "assistantId": VAPI_ASSISTANT_ID,
+        "customer": {
+            "number": to_phone,
+            "name": customer_id
+        },
+        "metadata": {
+            "customer_id": customer_id,
+            "source": "Vaani_AI_Dashboard"
+        }
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {VAPI_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-    if not os.path.exists(full_path):
-        if not AZURE_KEY: return ""
-        speech_config = speechsdk.SpeechConfig(subscription=AZURE_KEY, region=AZURE_REGION)
-        audio_config = speechsdk.audio.AudioOutputConfig(filename=full_path)
-        speech_config.speech_synthesis_voice_name = "hi-IN-MadhurNeural"
-        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
-        
-        ssml = f"<speak version='1.0' xml:lang='hi-IN'><voice name='hi-IN-MadhurNeural'><mstts:express-as style='cheerful'><prosody rate='-5%'>{text}</prosody></mstts:express-as></voice></speak>"
-        synthesizer.speak_ssml_async(ssml).get()
-
-    return f"{BASE_URL}/{path}"
-
-# Important for app.py imports
-def place_call(to_phone: str, from_phone: str, customer_id: str):
-    if not twilio_client: return print("Twilio not set")
     try:
-        call = twilio_client.calls.create(
-            machine_detection='Enable',
-            to=to_phone,
-            from_=from_phone,
-            url=f"{BASE_URL}/voice/twilio-voice"
-        )
-        redis_db.set(f"call:customer:{call.sid}", customer_id)
-        start_call_billing(call.sid, customer_id)
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code == 201:
+            return response.json()
+        else:
+            print(f"Vapi API Error: {response.text}")
+            return None
     except Exception as e:
-        print(f"Call Error: {e}")
+        print(f"Critical Call Error: {str(e)}")
+        return None
 
 # ==========================================
-# ROUTES
+# ROUTES (Endpoints)
 # ==========================================
 
-@router.post("/twilio-voice", response_class=PlainTextResponse)
-async def twilio_voice():
-    welcome = "Namaskar! Main Visora AI se baat kar raha hoon. Kya main aapki koi madad kar sakta hoon?"
-    audio = generate_voice(welcome)
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Play>{audio}</Play>
-        <Gather input="speech" timeout="5" action="{BASE_URL}/voice/process-speech" method="POST" interruptible="true"/>
-    </Response>"""
-
-@router.post("/process-speech", response_class=PlainTextResponse)
-async def process_speech(request: Request):
-    form = await request.form()
-    call_sid = form.get("CallSid")
-    user_text = (form.get("SpeechResult") or "").strip()
+@router.post("/start")
+async def start_voice_call(request: CallRequest):
+    """
+    Endpoint for Frontend Dialer
+    Path: /voice/start
+    """
+    # 1. Start Initial Billing Record
+    temp_sid = f"vapi_{int(os.getpid())}"
+    start_call_bill(temp_sid, request.customer_id)
     
-    if not user_text:
-        return f'<Response><Play>{generate_voice("Maaf kijiye, main sun nahi paaya.")}</Play><Gather input="speech" action="{BASE_URL}/voice/process-speech"/></Response>'
-
-    # Memory & AI Logic
-    add_call_memory(call_sid, "User", user_text)
-    history = get_call_memory(call_sid)
+    # 2. Trigger Call
+    result = place_vapi_call(request.to_phone, request.customer_id)
     
-    # 1. Check Sales Intent
-    intent = detect_sales_intent(user_text)
-    reply = upsell_reply(intent)
+    if not result:
+        raise HTTPException(status_code=500, detail="Call engine failed to respond")
+
+    # 3. Update Redis with real Vapi Call ID
+    vapi_call_id = result.get("id")
+    redis_db.set(f"call:customer:{vapi_call_id}", request.customer_id, ex=3600)
+
+    return {
+        "status": "success",
+        "call_id": vapi_call_id,
+        "provider": "vapi_ai",
+        "message": "AI Assistant is dialing..."
+    }
+
+@router.post("/webhook")
+async def vapi_callback_webhook(request: Request):
+    """
+    Vapi sends call reports here when call ends.
+    """
+    data = await request.json()
+    message_type = data.get("type")
     
-    # 2. If no sales reply, use Groq
-    if not reply:
-        reply = get_ai_reply(history, user_text)
+    if message_type == "end-of-call-report":
+        call_id = data.get("id")
+        customer_id = data.get("metadata", {}).get("customer_id", "unknown")
+        duration = data.get("duration", 0) # seconds mein
+        transcript = data.get("transcript", "")
+        
+        # 1. Stop Billing (Calculates cost based on duration)
+        stop_call_billing(call_id, customer_id, duration)
+        
+        # 2. Add to AI Memory (For future calls)
+        add_call_memory(customer_id, transcript)
+        
+        # 3. Detect Sales Intent (Marketing logic)
+        intent = detect_sales_intent(transcript)
+        if intent == "high":
+            print(f"Hot Lead Detected for {customer_id}")
 
-    add_call_memory(call_sid, "AI", reply)
-    audio = generate_voice(reply)
+    return {"status": "received"}
 
-    return f"""<Response>
-        <Play>{audio}</Play>
-        <Gather input="speech" action="{BASE_URL}/voice/process-speech" method="POST" interruptible="true"/>
-    </Response>"""
-
-@router.post("/call-status")
-async def call_status(request: Request):
-    form = await request.form()
-    sid = form.get("CallSid")
-    status = form.get("CallStatus")
-    if status in ["completed", "failed"]:
-        cid = redis_db.get(f"call:customer:{sid}")
-        stop_call_billing(sid, cid)
-    return {"status": "ok"}
+@router.get("/status/{call_id}")
+async def get_call_status(call_id: str):
+    """
+    Check if call is active or ended
+    """
+    url = f"https://api.vapi.ai/call/{call_id}"
+    headers = {"Authorization": f"Bearer {VAPI_API_KEY}"}
+    
+    response = requests.get(url, headers=headers)
+    return response.json()
