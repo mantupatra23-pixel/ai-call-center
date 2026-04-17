@@ -1,34 +1,29 @@
+# FastAPI Core
 fastapi
 uvicorn
 gunicorn
 
-# Twilio & Voice
-twilio
-python-multipart
+# Voice Engine (Vapi & Groq)
 requests
+groq
+httpx
 
-# Redis & Queue
+# Redis & Task Queue
 redis
 rq
 
 # Environment & Validation
 pydantic
+pydantic-settings
 python-dotenv
 email-validator
 
-# Security (LOGIN / AUTH)
+# Security (Auth)
 passlib[bcrypt]
 bcrypt
 python-jose[cryptography]
 
-# TTS (Google + ElevenLabs + Azure)
-gtts
-google-cloud-texttospeech
-azure-cognitiveservices-speech
-
-# Optional but recommended
-httpx
-groq
+# Utilities
 pytz
 reportlab
 razorpay
