@@ -1,8 +1,5 @@
-# api/wallet_api.py
-
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
-
 from services.wallet_service import (
     get_balance,
     add_balance,
@@ -10,79 +7,63 @@ from services.wallet_service import (
     has_sufficient_balance
 )
 
-from core.auth_guard import get_current_user, require_admin
+# --- INITIAL SETUP ---
+# app.py handle karega "/wallet" prefix ko
+router = APIRouter(tags=["Wallet"])
 
-router = APIRouter(prefix="/wallet", tags=["Wallet"])
-
-# =====================
-# MODELS
-# =====================
+# --- MODELS ---
 class WalletUpdate(BaseModel):
     customer_id: str
     amount: float
 
+# --- PUBLIC/DASHBOARD ROUTES ---
+# Ye frontend dialer aur dashboard ke liye hain
 
-# =====================
-# CUSTOMER: VIEW OWN WALLET
-# =====================
-@router.get("/me")
-def my_wallet(user=Depends(get_current_user)):
+@router.get("/balance/{customer_id}")
+async def wallet_balance(customer_id: str):
+    """
+    Frontend hits: GET /wallet/balance/mantu_admin
+    """
+    balance = get_balance(customer_id)
     return {
-        "customer_id": user["id"],
-        "balance": get_balance(user["id"]),
-        "can_make_call": has_sufficient_balance(user["id"])
+        "customer_id": customer_id,
+        "balance": f"{float(balance):.2f}",
+        "can_make_call": has_sufficient_balance(customer_id)
     }
 
+@router.post("/add")
+async def add_wallet_balance(data: WalletUpdate):
+    """
+    Frontend/Manual hit: POST /wallet/add
+    """
+    if data.amount <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount")
+    
+    new_balance = add_balance(data.customer_id, data.amount)
+    return {
+        "status": "credited",
+        "customer_id": data.customer_id,
+        "balance": new_balance
+    }
 
-# =====================
-# ADMIN: VIEW ANY WALLET
-# =====================
-@router.get("/balance")
-def wallet_balance(
-    customer_id: str = Query(...),
-    admin=Depends(require_admin)
-):
+# --- AUTH PROTECTED ROUTES (Optional/Future use) ---
+
+@router.get("/me")
+def my_wallet(customer_id: str = "mantu_admin"):
+    # Abhi ke liye hardcoded ya simple query rakha hai taaki crash na ho
     return {
         "customer_id": customer_id,
         "balance": get_balance(customer_id)
     }
 
-
-# =====================
-# ADMIN: ADD BALANCE
-# =====================
-@router.post("/admin/add")
-def admin_add_balance(
-    data: WalletUpdate,
-    admin=Depends(require_admin)
-):
+@router.post("/deduct")
+async def manual_deduct(data: WalletUpdate):
     if data.amount <= 0:
-        raise HTTPException(400, "Invalid amount")
-
-    balance = add_balance(data.customer_id, data.amount)
-
-    return {
-        "status": "credited",
-        "customer_id": data.customer_id,
-        "balance": balance
-    }
-
-
-# =====================
-# ADMIN: DEDUCT BALANCE
-# =====================
-@router.post("/admin/deduct")
-def admin_deduct_balance(
-    data: WalletUpdate,
-    admin=Depends(require_admin)
-):
-    if data.amount <= 0:
-        raise HTTPException(400, "Invalid amount")
-
-    balance = deduct_balance(data.customer_id, data.amount)
-
+        raise HTTPException(status_code=400, detail="Invalid amount")
+    
+    new_balance = deduct_balance(data.customer_id, data.amount)
     return {
         "status": "deducted",
         "customer_id": data.customer_id,
-        "balance": balance
+        "balance": new_balance
     }
