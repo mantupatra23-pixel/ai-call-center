@@ -2,43 +2,27 @@ import os
 import time
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from redis import Redis
-from rq import Queue
 
-# Internal Imports (Aapke existing structure ke hisaab se)
+# Internal Imports
 from db.redis import redis_db
-from api.voice_api import place_call
-from services.wallet_service import get_balance, has_sufficient_balance
-from services.safety_service import can_make_call
-from services.revenue_guard_service import can_start_call
-from services.notification_service import notify_low_balance
+from api.voice_api import place_vapi_call # Hum Vapi wala function use karenge
+from services.wallet_service import has_sufficient_balance
 from services.dnc_service import is_dnc
 from services.working_hours_service import is_within_hours
-from services.call_registry_service import register_call_start
-from services.billing_service import start_call_billing, stop_call_billing
-from services.active_call_service import add_active_call, remove_active_call
+from services.safety_service import can_make_call
 
-# 1. Router Setup (Prefix removed to avoid /call/call/start issue)
 router = APIRouter(tags=["Call"])
 
-# 2. Redis & Queue Setup
-REDIS_URL = os.getenv("REDIS_URL")
-if not REDIS_URL:
-    raise RuntimeError("REDIS_URL missing in environment variables")
-
-redis_conn = Redis.from_url(REDIS_URL, decode_responses=False)
-call_queue = Queue("calls", connection=redis_conn)
-
-# 3. Request Schema (JSON Body handle karne ke liye)
+# 1. Request Schema
 class StartCallRequest(BaseModel):
     customer_id: str
     to_phone: str
 
-# 4. START CALL ENDPOINT
+# 2. START CALL ENDPOINT
 @router.post("/start")
 async def start_call(data: StartCallRequest):
     """
-    Customer ke assigned Twilio number se call start karne ke liye.
+    Vapi AI Engine ke zariye call start karega (Twilio Bypass).
     Endpoint: /call/start
     """
     customer_id = data.customer_id
@@ -53,61 +37,50 @@ async def start_call(data: StartCallRequest):
     if not is_within_hours(customer_id):
         raise HTTPException(status_code=400, detail="Outside working hours")
 
-    # 3. Revenue Guard / Wallet Safety
-    if not can_start_call(customer_id):
-        raise HTTPException(status_code=402, detail="Low balance. Please refill.")
-
+    # 3. Wallet Safety Check
     if not has_sufficient_balance(customer_id):
-        raise HTTPException(status_code=402, detail="Insufficient wallet balance")
+        raise HTTPException(status_code=402, detail="Insufficient wallet balance. Please refill.")
 
     # 4. Rate Limit / Abuse Protection
     ok, reason = can_make_call(customer_id)
     if not ok:
         raise HTTPException(status_code=429, detail=reason)
 
-    # --- CALL ORCHESTRATION ---
-    # 5. Get Assigned Twilio Number
-    from_number = redis_db.get(f"customer:{customer_id}:phone")
-    if not from_number:
-        raise HTTPException(status_code=404, detail="No calling number assigned to this customer")
+    # --- VAPI ORCHESTRATION ---
+    try:
+        # Hum seedha Vapi engine ko call kar rahe hain jo Twilio bypass karega
+        result = place_vapi_call(to_phone, customer_id)
+        
+        if not result or "id" not in result:
+            raise HTTPException(status_code=500, detail="Voice Engine (Vapi) failed to respond")
 
-    # 6. Generate IDs and Start Processes
-    call_sid = f"call_{int(time.time())}_{customer_id}"
-    register_call_start(customer_id)
-    start_call_billing(call_sid, customer_id)
-    add_active_call(call_sid, customer_id, to_phone)
+        return {
+            "status": "success",
+            "queued": True,
+            "call_id": result.get("id"),
+            "customer_id": customer_id,
+            "to": to_phone,
+            "provider": "Vapi_HighSpeed_AI"
+        }
 
-    # 7. Enqueue Async Call
-    job = call_queue.enqueue(
-        place_call,
-        to_phone,
-        from_number,
-        customer_id
-    )
+    except Exception as e:
+        print(f"CRITICAL ERROR in call_api: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
-    return {
-        "queued": True,
-        "job_id": job.id,
-        "call_sid": call_sid,
-        "from": from_number,
-        "to": to_phone,
-        "customer_id": customer_id
-    }
-
-# 5. END CALL ENDPOINT
+# 3. END CALL ENDPOINT
 @router.post("/end")
-async def end_call(call_sid: str):
+async def end_call(call_id: str):
     """
-    Call end webhook or manual trigger.
-    Endpoint: /call/end
+    Manual call termination logic.
     """
-    bill = stop_call_billing(call_sid)
-    if not bill:
-        raise HTTPException(status_code=404, detail="Call not found or already ended")
+    from services.billing_service import stop_call_billing
+    from services.active_call_service import remove_active_call
 
-    remove_active_call(call_sid)
+    # Note: Vapi call duration webhook se handle hoti hai, ye manual end ke liye hai
+    bill = stop_call_billing(call_id, "manual_end", 0)
+    remove_active_call(call_id)
 
     return {
-        "status": "call_ended",
-        "billing": bill
+        "status": "request_sent",
+        "message": "Call termination signal sent"
     }
