@@ -10,14 +10,15 @@ load_dotenv()
 # --- FASTAPI CORE ---
 app = FastAPI(
     title="Vaani AI - Voice Engine",
-    description="High-Speed AI Call Center Backend (Vapi + Groq)",
+    description="High-Speed AI Call Center Backend",
     version="2.0.0"
 )
 
 # --- CORS CONFIG ---
+# Isse frontend se backend connect hone mein block nahi hoga
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,36 +35,29 @@ from api.call_api import router as call_router
 from api.vapi_webhook_api import router as vapi_webhook_router
 from api.vapi_live_api import router as vapi_live_router
 from api.vapi_recording_api import router as vapi_record_router
-from api.auth_api import router as auth_router
-from api.customer_api import router as customer_router
 from api.dashboard_api import router as dashboard_router
 from api.wallet_api import router as wallet_router
 from api.billing_api import router as billing_router
-from api.admin_dashboard_api import router as admin_router
 from api.vapi_whatsapp_api import router as whatsapp_router
-from api.dnc_api import router as dnc_router
-from api.working_hours_api import router as hours_router
-from api.revenue_guard_api import router as revenue_router
 
-# --- ROUTERS MOUNT (CRITICAL FIX FOR 404) ---
-# Dhyan dein: Prefix hata diye hain taaki api files ke internal paths kaam karein
-app.include_router(voice_router)         # Frontend hits: /voice/start
-app.include_router(call_router)          # Frontend hits: /call/end
-app.include_router(vapi_webhook_router)  # Vapi hits: /vapi/webhook
-app.include_router(vapi_live_router)     # Vapi hits: /vapi-live/balance-check
-app.include_router(vapi_record_router)   # Vapi hits: /vapi-recording/callback
+# --- ROUTERS MOUNT (SYNCED WITH FRONTEND) ---
 
-# Management & Safety
-app.include_router(auth_router)
-app.include_router(customer_router)
-app.include_router(dashboard_router)     # Frontend hits: /dashboard/stats
-app.include_router(wallet_router)        # Frontend hits: /wallet/balance/{id}
-app.include_router(billing_router)
-app.include_router(admin_router)
-app.include_router(whatsapp_router)
-app.include_router(dnc_router)
-app.include_router(hours_router)
-app.include_router(revenue_router)
+# 1. Voice & Call (Frontend hit: /voice/start)
+app.include_router(voice_router, prefix="/voice", tags=["Voice"])
+
+# 2. Wallet & Billing (Frontend hit: /wallet/balance/...)
+app.include_router(wallet_router, prefix="/wallet", tags=["Wallet"])
+app.include_router(billing_router, prefix="/billing", tags=["Billing"])
+
+# 3. Dashboard Stats (Frontend hit: /dashboard/stats)
+app.include_router(dashboard_router, prefix="/dashboard", tags=["Dashboard"])
+
+# 4. Call Control & Webhooks
+app.include_router(call_router, prefix="/call", tags=["Call"])
+app.include_router(vapi_webhook_router, prefix="/vapi", tags=["Vapi Webhook"])
+app.include_router(vapi_live_router, prefix="/vapi-live", tags=["Vapi Live"])
+app.include_router(vapi_record_router, prefix="/vapi-recording", tags=["Vapi Recording"])
+app.include_router(whatsapp_router, prefix="/whatsapp", tags=["WhatsApp"])
 
 # --- HEALTH CHECK ---
 @app.get("/", tags=["Health"])
